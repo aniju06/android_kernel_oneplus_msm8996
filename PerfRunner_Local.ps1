@@ -113,9 +113,9 @@ function Invoke-RobocopyTimed {
   $log = Join-Path $LogsDir ("robocopy_{0}_{1}.log" -f $Tag,(Get-Date -Format "yyyyMMdd_HHmmss_fff"))
 
   $args = @(
-    "`\"$SourceDir`\"", "`\"$DestDir`\"", "`\"$FileName`\"",
+    $SourceDir, $DestDir, $FileName,
     "/NP","/R:0","/W:0","/TEE","/NFL","/NDL",
-    "/LOG:`\"$log`\""
+    "/LOG:$log"
   )
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
