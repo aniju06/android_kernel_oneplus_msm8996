@@ -11,6 +11,16 @@ $CentralLogs    = "\\sccmprdfs01\f$\PerfStage\CentralLogs"
 $TestSizeGB  = 10
 $Iterations  = 3
 $CleanupTemp = $true
+$RunLargeFileTest = $true
+$RunSmallFilesTest = $true
+
+# small-file profiles (file count + size per file in MB)
+$SmallFileProfiles = @(
+  @{ Name="SF_1KB_x10000"; FileCount=10000; FileSizeMB=(1/1024) },
+  @{ Name="SF_64KB_x5000"; FileCount=5000; FileSizeMB=(64/1024) },
+  @{ Name="SF_1MB_x2000"; FileCount=2000; FileSizeMB=1 },
+  @{ Name="SF_4MB_x500"; FileCount=500; FileSizeMB=4 }
+)
 
 # Sources you wanted (script will SKIP if not reachable from this runner)
 $UncSources = @(
@@ -70,12 +80,30 @@ function Ensure-Writeable {
 }
 
 function New-TestFile {
-  param([string]$FilePath, [int]$SizeGB)
+  param([string]$FilePath, [double]$SizeGB)
   if (Test-Path $FilePath) { Remove-Item $FilePath -Force -ErrorAction SilentlyContinue }
-  $bytes = $SizeGB * 1GB
+  $bytes = [int64]([math]::Round($SizeGB * 1GB))
   $fs = [System.IO.File]::Open($FilePath,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)
   try { $fs.SetLength($bytes) } finally { $fs.Close() }
   if (-not (Test-Path $FilePath)) { throw "Failed to create file: $FilePath" }
+}
+
+function New-SmallFileSet {
+  param(
+    [string]$RootDir,
+    [string]$Prefix,
+    [int]$FileCount,
+    [double]$FileSizeMB
+  )
+
+  if (Test-Path $RootDir) { Remove-Item $RootDir -Force -Recurse -ErrorAction SilentlyContinue }
+  New-Item -ItemType Directory -Path $RootDir -Force | Out-Null
+
+  $sizeGB = $FileSizeMB / 1024
+  for ($idx=1; $idx -le $FileCount; $idx++) {
+    $name = "{0}_{1:D6}.dat" -f $Prefix, $idx
+    New-TestFile -FilePath (Join-Path $RootDir $name) -SizeGB $sizeGB
+  }
 }
 
 function Invoke-RobocopyTimed {
@@ -134,12 +162,39 @@ foreach ($d in $Destinations) {
 if (-not $GoodDests) { throw "No valid destinations reachable from runner." }
 
 # Create stage file
-$fileName  = "perf_{0}GB.dat" -f $TestSizeGB
-$stageFile = Join-Path $StageSrc $fileName
-Write-Host ("Creating stage file: {0} ({1} GB)" -f $stageFile, $TestSizeGB) -ForegroundColor Yellow
-New-TestFile -FilePath $stageFile -SizeGB $TestSizeGB
+$largeFileName  = "perf_{0}GB.dat" -f $TestSizeGB
+$largeStageFile = Join-Path $StageSrc $largeFileName
+
+if ($RunLargeFileTest) {
+  Write-Host ("Creating large stage file: {0} ({1} GB)" -f $largeStageFile, $TestSizeGB) -ForegroundColor Yellow
+  New-TestFile -FilePath $largeStageFile -SizeGB $TestSizeGB
+}
+
+$smallStages = @()
+if ($RunSmallFilesTest) {
+  foreach ($p in $SmallFileProfiles) {
+    $profileDir = Join-Path $StageSrc $p.Name
+    Write-Host ("Creating small-file set: {0} ({1} files x {2} MB)" -f $profileDir, $p.FileCount, $p.FileSizeMB) -ForegroundColor Yellow
+    New-SmallFileSet -RootDir $profileDir -Prefix $p.Name -FileCount $p.FileCount -FileSizeMB $p.FileSizeMB
+    $smallStages += [PSCustomObject]@{
+      Name=$p.Name
+      SourceDir=$profileDir
+      FileMask="*"
+      TotalSizeGB=([math]::Round(($p.FileCount * $p.FileSizeMB) / 1024, 4))
+      FileCount=$p.FileCount
+    }
+  }
+}
 
 $results = @()
+
+$testPlans = @()
+if ($RunLargeFileTest) {
+  $testPlans += [PSCustomObject]@{ Name="LARGE_FILE"; SourceDir=$StageSrc; FileMask=$largeFileName; TotalSizeGB=$TestSizeGB; FileCount=1 }
+}
+if ($RunSmallFilesTest) {
+  $testPlans += $smallStages
+}
 
 foreach ($src in $GoodSources) {
   $srcName = $src.Name
@@ -147,71 +202,76 @@ foreach ($src in $GoodSources) {
   $srcDir  = Join-Path $srcRoot ("_PERF_SRC_" + $Runner)
   New-Item -ItemType Directory -Path $srcDir -Force | Out-Null
 
-  Write-Host ("`n[SOURCE PREP] {0} -> {1}" -f $srcName, $srcDir) -ForegroundColor Cyan
-  $prep = Invoke-RobocopyTimed -SourceDir $StageSrc -DestDir $srcDir -FileName $fileName -Tag ("prep_" + $srcName)
-  if (-not $prep.Success) {
-    Write-Warning ("Prep failed for {0} (ExitCode={1}). Skipping." -f $srcName, $prep.ExitCode)
-    try { Remove-Item $srcDir -Force -Recurse -ErrorAction SilentlyContinue } catch {}
-    continue
-  }
-
-  foreach ($dst in $GoodDests) {
-    $dstName = $dst.Name
-    $dstRoot = ($dst.Path).TrimEnd('\\')
-    $dstDir  = Join-Path $dstRoot ("_PERFTEST_" + $Runner)
-    New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
-
-    $writeTimes = @()
-    $readTimes  = @()
-    $logs = @($prep.LogPath)
-
-    for ($i=1; $i -le $Iterations; $i++) {
-      Write-Host ("`n=== [{0}] [{1} -> {2}] WRITE {3}/{4} ===" -f $Runner, $srcName, $dstName, $i, $Iterations) -ForegroundColor Green
-      $w = Invoke-RobocopyTimed -SourceDir $srcDir -DestDir $dstDir -FileName $fileName -Tag ("w_{0}_{1}_{2}" -f $srcName,$dstName,$i)
-      $logs += $w.LogPath
-      if ($w.Success) { $writeTimes += $w.Seconds } else { Write-Warning ("WRITE failed (ExitCode={0})" -f $w.ExitCode) }
-
-      Write-Host ("`n=== [{0}] [{1} -> {2}] READ  {3}/{4} (dest->stage_out) ===" -f $Runner, $srcName, $dstName, $i, $Iterations) -ForegroundColor Green
-      $outFile = Join-Path $StageOut $fileName
-      if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue }
-      $r = Invoke-RobocopyTimed -SourceDir $dstDir -DestDir $StageOut -FileName $fileName -Tag ("r_{0}_{1}_{2}" -f $srcName,$dstName,$i)
-      $logs += $r.LogPath
-      if ($r.Success) { $readTimes += $r.Seconds } else { Write-Warning ("READ failed (ExitCode={0})" -f $r.ExitCode) }
-
-      try { Remove-Item (Join-Path $dstDir $fileName) -Force -ErrorAction SilentlyContinue } catch {}
-      try { Remove-Item (Join-Path $StageOut $fileName) -Force -ErrorAction SilentlyContinue } catch {}
+  foreach ($plan in $testPlans) {
+    $tagName = "{0}_{1}" -f $srcName, $plan.Name
+    Write-Host ("`n[SOURCE PREP] {0}/{1} -> {2}" -f $srcName, $plan.Name, $srcDir) -ForegroundColor Cyan
+    $prep = Invoke-RobocopyTimed -SourceDir $plan.SourceDir -DestDir $srcDir -FileName $plan.FileMask -Tag ("prep_" + $tagName)
+    if (-not $prep.Success) {
+      Write-Warning ("Prep failed for {0} (ExitCode={1}). Skipping." -f $tagName, $prep.ExitCode)
+      continue
     }
 
-    $avgW = if ($writeTimes.Count) { ($writeTimes | Measure-Object -Average).Average } else { $null }
-    $avgR = if ($readTimes.Count)  { ($readTimes  | Measure-Object -Average).Average } else { $null }
-    $wMB  = if ($avgW) { [math]::Round((($TestSizeGB*1024)/$avgW), 2) } else { $null }
-    $rMB  = if ($avgR) { [math]::Round((($TestSizeGB*1024)/$avgR), 2) } else { $null }
+    foreach ($dst in $GoodDests) {
+      $dstName = $dst.Name
+      $dstRoot = ($dst.Path).TrimEnd('\\')
+      $dstDir  = Join-Path $dstRoot ("_PERFTEST_" + $Runner)
+      New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
 
-    $srcSrv = Get-UncServer $src.Path
-    $dstSrv = Get-UncServer $dst.Path
+      $writeTimes = @()
+      $readTimes  = @()
+      $logs = @($prep.LogPath)
 
-    $results += [PSCustomObject]@{
-      RunnerHost=$Runner
-      RunnerIPv4=$RunnerIPs
-      Timestamp=(Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-      SourceName=$srcName
-      SourceUNC=$src.Path
-      SourceServer=$srcSrv
-      SourceIPv4=((Resolve-IPv4 $srcSrv) -join ", ")
-      DestName=$dstName
-      DestUNC=$dst.Path
-      DestServer=$dstSrv
-      DestIPv4=((Resolve-IPv4 $dstSrv) -join ", ")
-      TestSizeGB=$TestSizeGB
-      Iterations=$Iterations
-      AvgWrite_s= if ($avgW) { [math]::Round($avgW,2) } else { $null }
-      Write_MBps=$wMB
-      AvgRead_s=  if ($avgR) { [math]::Round($avgR,2) } else { $null }
-      Read_MBps=$rMB
-      RoboLogs=($logs -join "; ")
+      for ($i=1; $i -le $Iterations; $i++) {
+        Write-Host ("`n=== [{0}] [{1}/{2} -> {3}] WRITE {4}/{5} ===" -f $Runner, $srcName, $plan.Name, $dstName, $i, $Iterations) -ForegroundColor Green
+        $w = Invoke-RobocopyTimed -SourceDir $srcDir -DestDir $dstDir -FileName $plan.FileMask -Tag ("w_{0}_{1}_{2}_{3}" -f $srcName,$plan.Name,$dstName,$i)
+        $logs += $w.LogPath
+        if ($w.Success) { $writeTimes += $w.Seconds } else { Write-Warning ("WRITE failed (ExitCode={0})" -f $w.ExitCode) }
+
+        Write-Host ("`n=== [{0}] [{1}/{2} -> {3}] READ  {4}/{5} (dest->stage_out) ===" -f $Runner, $srcName, $plan.Name, $dstName, $i, $Iterations) -ForegroundColor Green
+        if (Test-Path $StageOut) { Remove-Item (Join-Path $StageOut '*') -Force -Recurse -ErrorAction SilentlyContinue }
+        $r = Invoke-RobocopyTimed -SourceDir $dstDir -DestDir $StageOut -FileName $plan.FileMask -Tag ("r_{0}_{1}_{2}_{3}" -f $srcName,$plan.Name,$dstName,$i)
+        $logs += $r.LogPath
+        if ($r.Success) { $readTimes += $r.Seconds } else { Write-Warning ("READ failed (ExitCode={0})" -f $r.ExitCode) }
+
+        if (Test-Path $dstDir) { Remove-Item (Join-Path $dstDir '*') -Force -Recurse -ErrorAction SilentlyContinue }
+        if (Test-Path $StageOut) { Remove-Item (Join-Path $StageOut '*') -Force -Recurse -ErrorAction SilentlyContinue }
+      }
+
+      $avgW = if ($writeTimes.Count) { ($writeTimes | Measure-Object -Average).Average } else { $null }
+      $avgR = if ($readTimes.Count)  { ($readTimes  | Measure-Object -Average).Average } else { $null }
+      $wMB  = if ($avgW) { [math]::Round((($plan.TotalSizeGB*1024)/$avgW), 2) } else { $null }
+      $rMB  = if ($avgR) { [math]::Round((($plan.TotalSizeGB*1024)/$avgR), 2) } else { $null }
+
+      $srcSrv = Get-UncServer $src.Path
+      $dstSrv = Get-UncServer $dst.Path
+
+      $results += [PSCustomObject]@{
+        RunnerHost=$Runner
+        RunnerIPv4=$RunnerIPs
+        Timestamp=(Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        TestProfile=$plan.Name
+        FileCount=$plan.FileCount
+        TestSizeGB=$plan.TotalSizeGB
+        SourceName=$srcName
+        SourceUNC=$src.Path
+        SourceServer=$srcSrv
+        SourceIPv4=((Resolve-IPv4 $srcSrv) -join ", ")
+        DestName=$dstName
+        DestUNC=$dst.Path
+        DestServer=$dstSrv
+        DestIPv4=((Resolve-IPv4 $dstSrv) -join ", ")
+        Iterations=$Iterations
+        AvgWrite_s= if ($avgW) { [math]::Round($avgW,2) } else { $null }
+        Write_MBps=$wMB
+        AvgRead_s=  if ($avgR) { [math]::Round($avgR,2) } else { $null }
+        Read_MBps=$rMB
+        RoboLogs=($logs -join "; ")
+      }
+
+      if ($CleanupTemp) { try { Remove-Item $dstDir -Force -Recurse -ErrorAction SilentlyContinue } catch {} }
     }
 
-    if ($CleanupTemp) { try { Remove-Item $dstDir -Force -Recurse -ErrorAction SilentlyContinue } catch {} }
+    if (Test-Path $srcDir) { Remove-Item (Join-Path $srcDir '*') -Force -Recurse -ErrorAction SilentlyContinue }
   }
 
   if ($CleanupTemp) { try { Remove-Item $srcDir -Force -Recurse -ErrorAction SilentlyContinue } catch {} }
@@ -222,7 +282,7 @@ $results | Export-Csv -NoTypeInformation -Path $csv
 Write-Host ("`nSaved CSV: {0}" -f $csv) -ForegroundColor Yellow
 
 if ($CleanupTemp) {
-  try { Remove-Item $stageFile -Force -ErrorAction SilentlyContinue } catch {}
+  try { Remove-Item $largeStageFile -Force -ErrorAction SilentlyContinue } catch {}
   try { Remove-Item $StageRoot -Force -Recurse -ErrorAction SilentlyContinue } catch {}
 }
 
